@@ -1,0 +1,822 @@
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/chromedp/chromedp"
+	"github.com/gomodule/redigo/redis"
+	"github.com/robfig/cron/v3"
+	"github.com/urfave/cli"
+	"go.uber.org/zap"
+	_ "log"
+	"regexp"
+	"strconv"
+	"strings"
+	"tea.tzuyanglin.tw/brbbear/netflixbot/src/libs"
+	"time"
+)
+
+type (
+	account struct {
+		account  string
+		password string
+	}
+
+	info struct {
+		wallet        float64
+		currency      string
+		plan          string
+		nextCycle     string
+		historyDate   string
+		historyPeriod string
+		historyTotal  string
+	}
+
+	bot struct {
+		context context.Context
+		cancel context.CancelFunc
+		accounts []account
+	}
+)
+
+var (
+	log *zap.SugaredLogger
+)
+
+func newBot() *bot {
+	var bot bot
+
+	ctx, cancel := chromedp.NewContext(
+		context.Background(),
+		//chromedp.WithLogf(log.Infof),
+		//chromedp.WithDebugf(log.Debugf),
+		//chromedp.WithErrorf(log.Errorf),
+	)
+
+	bot.context = ctx
+	bot.cancel = cancel
+
+	return &bot
+}
+
+func (b *bot) login(a libs.Account) (page []byte, err error) {
+	log.Infow("Login", "account", a.Account, "password", a.Password)
+
+	ctx, cancel := context.WithTimeout(b.context, 30*time.Second)
+	defer cancel()
+	ctx, _ = chromedp.NewContext(ctx)
+
+	var page1 []byte
+	var message string
+
+	err = chromedp.Run(ctx,
+		chromedp.Navigate("https://www.netflix.com/login"),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.WaitVisible("input[data-uia='login-field']"),
+		chromedp.SendKeys("input[data-uia='login-field']", a.Account, chromedp.BySearch),
+		chromedp.WaitVisible("input[data-uia='password-field']"),
+		chromedp.SendKeys("input[data-uia='password-field']", a.Password, chromedp.BySearch),
+		chromedp.Click("button[data-uia='password-visibility-toggle']", chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page1),
+		chromedp.Click("button[data-uia='login-submit-button']", chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page),
+	)
+	libs.SaveFullScreenshot(page1, "login2", a.Account)
+
+	err2 := chromedp.Run(ctx,
+		chromedp.Text("div[class='ui-message-contents']", &message, chromedp.NodeVisible, chromedp.BySearch),
+	)
+	if err2 == nil {
+		log.Infow("login", "message", message)
+		return page, errors.New(message)
+	}
+
+	return
+}
+
+func (b *bot) logout() (page []byte, err error) {
+	log.Info("Logout")
+
+	ctx, cancel := context.WithTimeout(b.context, 30*time.Second)
+	defer cancel()
+	ctx, _ = chromedp.NewContext(ctx)
+
+	err = chromedp.Run(ctx,
+		chromedp.Navigate("https://www.netflix.com/SignOut?lnkctr=ml"),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page),
+	)
+	return
+}
+
+func (b *bot) getUserInfo() (info info, page []byte, err error) {
+	log.Info("Get YourAccount")
+
+	ctx, cancel := context.WithTimeout(b.context, 30*time.Second)
+	defer cancel()
+	ctx, _ = chromedp.NewContext(ctx)
+
+	var nextCycle, historyDate, historyPeriod, historyTotal string
+
+	err = chromedp.Run(ctx,
+		chromedp.Navigate("https://www.netflix.com/BillingActivity"),
+		chromedp.Sleep(10 * time.Second),
+		chromedp.CaptureScreenshot(&page),
+		//chromedp.Text("div[class='billingSummaryContents'] div span b", &info.plan, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Text("div[data-uia='streaming-next-cycle']", &nextCycle, chromedp.NodeVisible, chromedp.BySearch),
+		//chromedp.WaitVisible("li[class='retableHeading']"),
+		//chromedp.WaitVisible("div[data-uia='billing-details-invoice-history-date-0']"),
+		chromedp.Text("div[data-uia='billing-details-invoice-history-date-0'] a", &historyDate, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Text("div[data-uia='billing-details-invoice-history-period-0']", &historyPeriod, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Text("div[class='billingSectionSpace'] li:nth-child(2) div[class='col billTotal']", &historyTotal, chromedp.NodeVisible, chromedp.BySearch),
+		//chromedp.Sleep(3 * time.Second),
+	)
+	if err != nil {
+		return
+	}
+
+	log.Infow("getUserInfo", "nextCycle", nextCycle)
+	if len(nextCycle) > 0 {
+		if t, err := time.Parse("2006/1/2", nextCycle); err == nil {
+			info.nextCycle = t.Format("2006-01-02")
+		} else if t, err = time.Parse("2006年1月2日", nextCycle); err == nil {
+			info.nextCycle = t.Format("2006-01-02")
+		} else if t, err = time.Parse("January 2, 2006", nextCycle); err == nil {
+			info.nextCycle = t.Format("2006-01-02")
+		}
+	}
+
+	log.Infow("getUserInfo", "historyPeriod", historyPeriod)
+	if len(info.nextCycle) == 0 {
+		if len(historyPeriod) > 0 {
+			history := strings.Split(historyPeriod, "—")
+			fmt.Println(history)
+			if len(history) == 2 {
+				if t, err := time.Parse("2006/1/2", history[1]); err == nil {
+					info.nextCycle = t.Add(24 * time.Hour).Format("2006-01-02")
+				} else if t, err = time.Parse("2006年1月2日", history[1]); err == nil {
+					info.nextCycle = t.Add(24 * time.Hour).Format("2006-01-02")
+				} else if t, err = time.Parse("1/2/06", history[1]); err == nil {
+					info.nextCycle = t.Add(24 * time.Hour).Format("2006-01-02")
+				} else if t, err = time.Parse("2/1/06", history[1]); err == nil {
+					info.nextCycle = t.Add(24 * time.Hour).Format("2006-01-02")
+				}
+			}
+		}
+	}
+
+	log.Infow("getUserInfo", "historyDate", historyDate)
+	if t, err := time.Parse("2006/1/2", historyDate); err == nil {
+		info.historyDate = t.Format("2006-01-02")
+	} else if t, err = time.Parse("2006年1月2日", historyDate); err == nil {
+		info.historyDate = t.Format("2006-01-02")
+	} else if t, err = time.Parse("1/2/06", historyDate); err == nil {
+		info.historyDate = t.Format("2006-01-02")
+	} else if t, err = time.Parse("2/1/06", historyDate); err == nil {
+		info.historyDate = t.Format("2006-01-02")
+	}
+
+	log.Infow("getUserInfo", "historyTotal", historyTotal)
+	// ARS199
+	// 17.99 TL
+
+	if ret := strings.Index(historyTotal, "ARS"); ret != -1 {
+		info.currency = "ARS"
+	} else if strings.Index(historyTotal, "TL") != -1 {
+		info.currency = "TL"
+	}
+
+	var walletStr string
+
+	err = chromedp.Run(ctx,
+		chromedp.Text("div[data-uia='gift-credit-content-headline']", &walletStr, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page),
+	)
+	if err != nil {
+		log.Infow("getUserWallet", "err", err)
+	}
+
+	info.wallet, err = func(wallet string) (float64, error) {
+		if len(wallet) == 0 {
+			return 0, nil
+		}
+		fmt.Println("wallet", wallet)
+		re := regexp.MustCompile("[0-9.]+")
+		ret := re.FindAllString(wallet, -1)
+		if len(ret) != 1 {
+			return 0, nil
+		}
+		return strconv.ParseFloat(ret[0], 64)
+	}(walletStr)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
+func (b *bot) getUserPlanEnabled() (plan string, page []byte, err error) {
+	log.Info("Get Plan Enabled")
+
+	dataUiaId := -1
+	//dataUiaIds := []string{"plan-option-4001", "plan-option-3088", "plan-option-3108"}
+	dataUiaIds := []string{"plan-option-4001", "plan-option-3108"}
+
+	for i, id := range dataUiaIds {
+		ctx, cancel := context.WithTimeout(b.context, 20*time.Second)
+		ctx, _ = chromedp.NewContext(ctx)
+		log.Info(id)
+		err = chromedp.Run(ctx,
+			chromedp.Navigate("https://www.netflix.com/ChangePlan"),
+			chromedp.Sleep(3 * time.Second),
+			chromedp.WaitVisible(fmt.Sprintf(".//li[@data-uia-id='%s'][@class='pointer clearfix stacked-large-selection-list-item selected']", id)),
+			chromedp.CaptureScreenshot(&page),
+		)
+
+		cancel()
+
+		if err == nil {
+			dataUiaId = i
+			break
+		}
+	}
+
+	switch dataUiaId {
+	case 0: plan="Basic"
+	case 1: plan="Premium"
+	//case 1: plan="Standard"
+	//case 2: plan="Premium"
+	default:
+	}
+
+	return
+}
+
+func (b *bot) getUserPlanDisabled() (plan string, page []byte, err error) {
+	log.Info("Get Plan Disabled")
+
+	dataUiaId := -1
+	//dataUiaIds := []string{"plan-option-4001", "plan-option-3088", "plan-option-3108"}
+	dataUiaIds := []string{"plan-option-4001", "plan-option-3108"}
+
+	for i, id := range dataUiaIds {
+		ctx, cancel := context.WithTimeout(b.context, 20*time.Second)
+		ctx, _ = chromedp.NewContext(ctx)
+		log.Info(id)
+		err = chromedp.Run(ctx,
+			chromedp.Navigate("https://www.netflix.com/ChangePlan"),
+			chromedp.Sleep(3 * time.Second),
+			chromedp.WaitVisible(fmt.Sprintf(".//li[@data-uia-id='%s'][@class='pointer clearfix stacked-large-selection-list-item-disabled disabled selected']", id)),
+			chromedp.CaptureScreenshot(&page),
+		)
+
+		cancel()
+
+		if err == nil {
+			dataUiaId = i
+			break
+		}
+	}
+
+	switch dataUiaId {
+	case 0: plan="Basic"
+	case 1: plan="Premium"
+	//case 1: plan="Standard"
+	//case 2: plan="Premium"
+	default:
+	}
+
+	return
+}
+
+func (b *bot) getUserPlan() (plan string, page []byte, err error) {
+	log.Info("Get Plan")
+
+	plan, page, err = b.getUserPlanEnabled()
+	if len(plan) == 0 {
+		plan, page, err = b.getUserPlanDisabled()
+		if plan == "Premium" {
+			plan = "Basic"
+		} else if plan == "Basic" {
+			plan = "Premium"
+		}
+	}
+
+	return
+}
+
+func (b *bot) changePlanToPremium() (page1, page2, page3 []byte, err error) {
+	//var message string
+	ctx, cancel := context.WithTimeout(b.context, 16*time.Second)
+	defer cancel()
+	ctx, _ = chromedp.NewContext(ctx)
+
+	err = chromedp.Run(ctx,
+		chromedp.Navigate("https://www.netflix.com/ChangePlan"),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page1),
+		//chromedp.Text("div[class='ui-message-contents']", &message, chromedp.NodeVisible, chromedp.BySearch),
+		//chromedp.Click("li[data-uia-id='plan-option-4001']", chromedp.BySearch),
+		//chromedp.Click("li[data-uia-id='plan-option-3088']", chromedp.BySearch),
+		chromedp.Click("li[data-uia-id='plan-option-3108']", chromedp.BySearch),
+		chromedp.Sleep(1 * time.Second),
+		chromedp.Click("button[data-uia='action-save-plan']", chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page2),
+		//chromedp.Text("div[class='modal-additional-info']", &message, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.Click("button[data-uia='action-button']", chromedp.BySearch),
+		chromedp.CaptureScreenshot(&page3),
+	)
+	if err != nil {
+		log.Infow("err", err)
+	}
+	//log.Infow("message", message)
+
+	return
+}
+
+func (b *bot) changePlanToBasic() (page1, page2, page3 []byte, err error) {
+	var message string
+
+	ctx, cancel := context.WithTimeout(b.context, 16*time.Second)
+	defer cancel()
+	ctx, _ = chromedp.NewContext(ctx)
+
+	err = chromedp.Run(ctx,
+		chromedp.Navigate("https://www.netflix.com/ChangePlan"),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page1),
+		//chromedp.Text("div[class='ui-message-contents']", &message, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Click("li[data-uia-id='plan-option-4001']", chromedp.BySearch),
+		//chromedp.Click("li[data-uia-id='plan-option-3088']", chromedp.BySearch),
+		//chromedp.Click("li[data-uia-id='plan-option-3108']", chromedp.BySearch),
+		chromedp.Sleep(1 * time.Second),
+		chromedp.Click("button[data-uia='action-save-plan']", chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page2),
+		//chromedp.Text("div[class='modal-additional-info']", &message, chromedp.NodeVisible, chromedp.BySearch),
+		chromedp.Click("button[data-uia='action-button']", chromedp.BySearch),
+		chromedp.Sleep(3 * time.Second),
+		chromedp.CaptureScreenshot(&page3),
+	)
+	if err != nil {
+		log.Infow("err", err)
+	}
+	log.Infow("message", message)
+
+	return
+}
+
+func syncAccountInfo(account libs.Account) {
+	bot := newBot()
+	defer bot.cancel()
+
+	if err := chromedp.Run(bot.context); err != nil {
+		log.Info("chromedp run failed")
+		return
+	}
+
+	var isDone bool
+	var lastErr error
+
+	for i:=0; i<3; i++ {
+		if page, err := bot.login(account); err == nil {
+			libs.SaveFullScreenshot(page, "login", account.Account)
+
+			if info, page, err := bot.getUserInfo(); err == nil {
+				libs.SaveFullScreenshot(page, "billing", account.Account)
+				info.plan, page, _ = bot.getUserPlan()
+				libs.SaveFullScreenshot(page, "changeplan", account.Account)
+
+				if len(info.plan) != 0 {
+					log.Infow("syncAccountsInfo", "wallet", info.wallet)
+					log.Infow("syncAccountsInfo", "currency", info.currency)
+					log.Infow("syncAccountsInfo", "plan", info.plan)
+					log.Infow("syncAccountsInfo", "nextCycle", info.nextCycle)
+					log.Infow("syncAccountsInfo", "historyDate", info.historyDate)
+					log.Infow("syncAccountsInfo", "historyPeriod", info.historyPeriod)
+					log.Infow("syncAccountsInfo", "historyTotal", info.historyTotal)
+
+					_, err = libs.DBNetflixHistoryAdd(account.Id, info.wallet, info.currency, info.plan, info.historyDate, info.nextCycle)
+					if err != nil {
+						log.Infow("DBNetflixHistoryAdd", "err", err)
+						lastErr = err
+					}
+
+					err = libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", account.Id)}, "同步完成")
+					if err != nil {
+						log.Infow("DBNetflixSutatsUpdate", "err", err)
+					}
+					isDone = true
+				}
+			} else {
+				log.Infow("syncAccountsInfo.getUserInfo", "err", err)
+				lastErr = err
+				libs.SaveFullScreenshot(page, "billing", account.Account)
+			}
+		} else {
+			log.Infow("syncAccountsInfo.login", "err", err)
+			if err.Error() == "Incorrect password. Please try again or you can reset your password." {
+				err = libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", account.Id)}, "帳號或密碼錯誤")
+				if err != nil {
+					log.Infow("DBNetflixSutatsUpdate", "err", err)
+					lastErr = err
+				}
+				break
+			}
+		}
+
+		if page, err := bot.logout(); err != nil {
+			log.Infow("logout", "err", err)
+			lastErr = err
+		} else {
+			libs.SaveFullScreenshot(page, "logout", account.Account)
+		}
+
+		time.Sleep(time.Second * 3)
+
+		if isDone {
+			break
+		}
+	}
+
+	if !isDone {
+		if lastErr != nil && lastErr.Error() == "context deadline exceeded" {
+			if err := libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", account.Id)}, "同步失敗"); err != nil {
+				log.Infow("DBNetflixSutatsUpdate", "err", err)
+			}
+		}
+	}
+}
+
+func redisReceiveAccountCheckTask() {
+	newPubSubConn := func() (psc redis.PubSubConn) {
+		psc = libs.GetPubSubConn()
+
+		err := psc.PSubscribe("netflix")
+		if err != nil {
+			log.Infow("redis", "err", err)
+		}
+
+		return psc
+	}
+
+	psc := newPubSubConn()
+	defer func() {
+		err := psc.Conn.Close()
+		if err != nil {
+			fmt.Println(err)
+		}
+	}()
+
+	for {
+		switch n := psc.Receive().(type) {
+		case redis.Message:
+			log.Infow("Receive a message",
+				"pattern", n.Pattern,
+				"channel", n.Channel,
+				"msg", string(n.Data))
+			switch n.Channel {
+			case "netflix":
+				var a libs.Account
+				if err := json.Unmarshal(n.Data, &a); err != nil {
+					log.Infow("Subscribe", n.Data, err)
+					break
+				}
+				log.Infow("redisReceiveAccountCheckTask", "account", a)
+
+				err := libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", a.Id)}, "同步中")
+				if err != nil {
+					log.Infow("DBNetflixSutatsUpdate", "err", err)
+				}
+
+				syncAccountInfo(a)
+			default:
+			}
+		case error:
+			log.Infow("Receive a message",
+				"err", "type",
+				"n", n)
+			time.Sleep(1 * time.Minute)
+			fmt.Println("Reconnect Redis Server")
+			libs.ReconnectRDS()
+			time.Sleep(1 * time.Minute)
+			psc = newPubSubConn()
+		}
+	}
+}
+
+func syncAccountsInfo(accounts []libs.Account) {
+	//account := "afvbmh@sina.com"
+	//password := "wsxqaz33"
+
+	log.Infow("syncAccountsInfo", "accounts", len(accounts))
+
+	var ids []string
+
+	for _, a := range accounts {
+		ids = append(ids, fmt.Sprintf("%d", a.Id))
+	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	err := libs.DBNetflixSutatsUpdate(ids, "同步中")
+	if err != nil {
+		log.Infow("DBNetflixSutatsUpdate", "err", err)
+	}
+
+	for _, a := range accounts {
+		syncAccountInfo(a)
+	}
+}
+
+func changeAccountToBasic(account libs.Account) {
+	bot := newBot()
+	defer bot.cancel()
+
+	if err := chromedp.Run(bot.context); err != nil {
+		log.Info("chromedp run failed")
+		return
+	}
+
+	var isDone bool
+
+	for i:=0; i<3; i++ {
+		if page, err := bot.login(account); err != nil {
+			log.Infow("changeAccountsToBasic", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page, "login", account.Account)
+		}
+
+		if page1, page2, page3, err := bot.changePlanToBasic(); err != nil {
+			log.Infow("changeAccountsToBasic", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page1, "changeplan", account.Account)
+			libs.SaveFullScreenshot(page2, "check", account.Account)
+			libs.SaveFullScreenshot(page3, "save", account.Account)
+		}
+
+		if info, page, err := bot.getUserInfo(); err != nil {
+			log.Infow("changeAccountsToBasic", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page, "billing", account.Account)
+			info.plan, page, _ = bot.getUserPlan()
+			libs.SaveFullScreenshot(page, "changeplan", account.Account)
+
+			if len(info.plan) != 0 {
+				log.Infow("changeAccountsToBasic", "wallet", info.wallet)
+				log.Infow("changeAccountsToBasic", "currency", info.currency)
+				log.Infow("changeAccountsToBasic", "plan", info.plan)
+				log.Infow("changeAccountsToBasic", "nextCycle", info.nextCycle)
+				log.Infow("changeAccountsToBasic", "historyDate", info.historyDate)
+				log.Infow("changeAccountsToBasic", "historyPeriod", info.historyPeriod)
+				log.Infow("changeAccountsToBasic", "historyTotal", info.historyTotal)
+
+				_, err = libs.DBNetflixHistoryAdd(account.Id, info.wallet, info.currency, info.plan, info.historyDate, info.nextCycle)
+				if err != nil {
+					log.Infow("DBNetflixHistoryAdd", "err", err)
+				}
+
+				err = libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", account.Id)}, "同步完成")
+				if err != nil {
+					log.Infow("DBNetflixSutatsUpdate", "err", err)
+				}
+
+				isDone = true
+			}
+		}
+
+		if page, err := bot.logout(); err != nil {
+			log.Infow("changeAccountsToBasic", "err", err)
+		} else {
+			libs.SaveFullScreenshot(page, "logout", account.Account)
+		}
+
+		time.Sleep(time.Second * 3)
+
+		if isDone {
+			break
+		}
+	}
+}
+
+func changeAccountsToBasic(accounts []libs.Account) {
+	//account := "afvbmh@sina.com"
+	//password := "wsxqaz33"
+
+	log.Infow("changeAccountsToBasic", "accounts", len(accounts))
+
+	var ids []string
+
+	for _, a := range accounts {
+		ids = append(ids, fmt.Sprintf("%d", a.Id))
+	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	err := libs.DBNetflixSutatsUpdate(ids, "更換到 Basic...")
+	if err != nil {
+		log.Infow("DBNetflixSutatsUpdate", "err", err)
+	}
+
+	for _, a := range accounts {
+		changeAccountToBasic(a)
+	}
+}
+
+func changeAccountToPremium(account libs.Account) {
+	bot := newBot()
+	defer bot.cancel()
+
+	if err := chromedp.Run(bot.context); err != nil {
+		log.Info("chromedp run failed")
+		return
+	}
+
+	var isDone bool
+
+	for i:=0; i<3; i++ {
+		if page, err := bot.login(account); err != nil {
+			log.Infow("checkAccounttoPremium", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page, "login", account.Account)
+		}
+
+		if page1, page2, page3, err := bot.changePlanToPremium(); err != nil {
+			log.Infow("checkAccounttoPremium", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page1, "changeplan", account.Account)
+			libs.SaveFullScreenshot(page2, "check", account.Account)
+			libs.SaveFullScreenshot(page3, "save", account.Account)
+		}
+
+		if info, page, err := bot.getUserInfo(); err != nil {
+			log.Infow("checkAccounttoPremium", "err", err)
+			continue
+		} else {
+			libs.SaveFullScreenshot(page, "billing", account.Account)
+			info.plan, page, _ = bot.getUserPlan()
+			libs.SaveFullScreenshot(page, "changeplan", account.Account)
+
+			log.Infow("changeAccountsToPremium", "wallet", info.wallet)
+			log.Infow("changeAccountsToPremium", "currency", info.currency)
+			log.Infow("changeAccountsToPremium", "plan", info.plan)
+			log.Infow("changeAccountsToPremium", "nextCycle", info.nextCycle)
+			log.Infow("changeAccountsToPremium", "historyDate", info.historyDate)
+			log.Infow("changeAccountsToPremium", "historyPeriod", info.historyPeriod)
+			log.Infow("changeAccountsToPremium", "historyTotal", info.historyTotal)
+
+			_, err = libs.DBNetflixHistoryAdd(account.Id, info.wallet, info.currency, info.plan, info.historyDate, info.nextCycle)
+			if err != nil {
+				log.Infow("DBNetflixHistoryAdd", "err", err)
+			}
+
+			err = libs.DBNetflixSutatsUpdate([]string{fmt.Sprintf("%d", account.Id)}, "同步完成")
+			if err != nil {
+				log.Infow("DBNetflixSutatsUpdate", "err", err)
+			}
+
+			isDone = true
+		}
+
+		if page, err := bot.logout(); err != nil {
+			log.Infow("checkAccounttoPremium", "err", err)
+		} else {
+			libs.SaveFullScreenshot(page, "logout", account.Account)
+		}
+
+		time.Sleep(time.Second * 3)
+
+		if isDone {
+			break
+		}
+	}
+}
+
+func changeAccountsToPremium(accounts []libs.Account) {
+	//account := "afvbmh@sina.com"
+	//password := "wsxqaz33"
+
+	log.Infow("changeAccountsToPremium", "accounts", len(accounts))
+
+	var ids []string
+
+	for _, a := range accounts {
+		ids = append(ids, fmt.Sprintf("%d", a.Id))
+	}
+
+	if len(ids) == 0 {
+		return
+	}
+
+	err := libs.DBNetflixSutatsUpdate(ids, "更換到 Premium...")
+	if err != nil {
+		log.Infow("DBNetflixSutatsUpdate", "err", err)
+	}
+
+	for _, a := range accounts {
+		changeAccountToPremium(a)
+	}
+}
+
+func botStart(logger *zap.Logger, ctx *cli.Context) error {
+	sqlServer := ctx.String("sql-server")
+	sqlUser := ctx.String("sql-user")
+	sqlPassword := ctx.String("sql-passwd")
+	rdsServer := ctx.String("redis-server")
+	fileLocal := ctx.String("file-save-local")
+
+	log = logger.Sugar()
+
+	libs.NewDB(sqlServer, sqlUser, sqlPassword, "brbbear")
+	libs.NewRDS(rdsServer)
+	libs.SetFileSaveLocal(fileLocal)
+
+	//zone := time.FixedZone("taipei", 8*3600)
+
+	if total, accounts, err := libs.DBNetflixNewGet(); err != nil {
+		log.Infow("task", "get", err)
+	} else if total > 0 {
+		syncAccountsInfo(accounts)
+	}
+
+	log.Info(time.Now())
+
+	// Seconds field, required
+	c := cron.New(cron.WithSeconds())
+
+	_, err := c.AddFunc("0 0 8 * * *", func() {
+		//cycle := time.Now().Add(time.Hour * 24 * -1).Format("2006-01-02")
+		today := time.Now().Format("2006-01-02")
+
+		log.Infow("cront", "today.8", today)
+
+		if total, accounts, err := libs.DBNetflixGet("Premium", "", "", today); err != nil {
+			log.Infow("task", "Premium", err)
+		} else if total > 0 {
+			// check for basic
+			log.Infow("task", "changeAccountsToBasic", len(accounts), "accounts", accounts)
+			changeAccountsToBasic(accounts)
+		}
+	})
+	if err != nil {
+		log.Infow("err", err)
+		return err
+	}
+
+	_, err = c.AddFunc("0 0 12 * * *", func() {
+		today := time.Now().Format("2006-01-02")
+
+		log.Infow("cront", "today.12", today)
+
+		if total, accounts, err := libs.DBNetflixGet("Basic", "TL", "", today); err != nil {
+			log.Infow("task", "Basic", err)
+		} else if total > 0 {
+			// check for permimn
+			log.Infow("task", "changeAccountsToPremium", len(accounts), "accounts", accounts)
+			changeAccountsToPremium(accounts)
+		}
+	})
+	if err != nil {
+		log.Infow("err", err)
+		return err
+	}
+
+	_, err = c.AddFunc("0 0 20 * * *", func() {
+		today := time.Now().Format("2006-01-02")
+
+		log.Infow("cront", "today.12", today)
+
+		if total, accounts, err := libs.DBNetflixGet("Basic", "ARS", "", today); err != nil {
+			log.Infow("task", "Basic", err)
+		} else if total > 0 {
+			// check for permimn
+			log.Infow("task", "changeAccountsToPremium", len(accounts), "accounts", accounts)
+			changeAccountsToPremium(accounts)
+		}
+	})
+	if err != nil {
+		log.Infow("err", err)
+		return err
+	}
+
+	c.Start()
+	defer c.Stop()
+
+	redisReceiveAccountCheckTask()
+
+	return nil
+}
